@@ -2,14 +2,168 @@
 MongoDB database configuration and setup for Mergington High School API
 """
 
+import copy
+import os
+from typing import Any, Dict, Iterable, List, Optional
+
 from pymongo import MongoClient
 from argon2 import PasswordHasher, exceptions as argon2_exceptions
 
-# Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['mergington_high']
-activities_collection = db['activities']
-teachers_collection = db['teachers']
+
+class _UpdateResult:
+    def __init__(self, modified_count: int):
+        self.modified_count = modified_count
+
+
+class InMemoryCollection:
+    def __init__(self):
+        self._documents: Dict[str, Dict[str, Any]] = {}
+
+    def _get_value(self, doc: Dict[str, Any], field: str) -> Any:
+        current: Any = doc
+        for part in field.split("."):
+            if not isinstance(current, dict) or part not in current:
+                return None
+            current = current[part]
+        return current
+
+    def _matches(self, doc: Dict[str, Any], query: Dict[str, Any]) -> bool:
+        for key, expected in query.items():
+            value = self._get_value(doc, key)
+
+            if isinstance(expected, dict):
+                if "$in" in expected:
+                    candidates = expected["$in"]
+                    if isinstance(value, list):
+                        if not any(item in candidates for item in value):
+                            return False
+                    elif value not in candidates:
+                        return False
+                if "$gte" in expected and (value is None or value < expected["$gte"]):
+                    return False
+                if "$lte" in expected and (value is None or value > expected["$lte"]):
+                    return False
+            else:
+                if value != expected:
+                    return False
+
+        return True
+
+    def count_documents(self, query: Dict[str, Any]) -> int:
+        return sum(1 for _ in self.find(query))
+
+    def insert_one(self, doc: Dict[str, Any]):
+        document_id = doc.get("_id")
+        if document_id is None:
+            raise ValueError("Document must include _id")
+        self._documents[document_id] = copy.deepcopy(doc)
+
+    def find(self, query: Optional[Dict[str, Any]] = None) -> Iterable[Dict[str, Any]]:
+        effective_query = query or {}
+        for doc in self._documents.values():
+            if self._matches(doc, effective_query):
+                yield copy.deepcopy(doc)
+
+    def find_one(self, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        for doc in self.find(query):
+            return doc
+        return None
+
+    def update_one(self, query: Dict[str, Any], update: Dict[str, Any]) -> _UpdateResult:
+        for document_id, doc in self._documents.items():
+            if not self._matches(doc, query):
+                continue
+
+            modified = False
+            if "$push" in update:
+                for key, value in update["$push"].items():
+                    current = doc.setdefault(key, [])
+                    if value not in current:
+                        current.append(value)
+                        modified = True
+
+            if "$pull" in update:
+                for key, value in update["$pull"].items():
+                    current = doc.get(key, [])
+                    if value in current:
+                        doc[key] = [item for item in current if item != value]
+                        modified = True
+
+            self._documents[document_id] = doc
+            return _UpdateResult(modified_count=1 if modified else 0)
+
+        return _UpdateResult(modified_count=0)
+
+    def aggregate(self, pipeline: List[Dict[str, Any]]) -> Iterable[Dict[str, Any]]:
+        docs: List[Dict[str, Any]] = [copy.deepcopy(doc) for doc in self._documents.values()]
+
+        for stage in pipeline:
+            if "$unwind" in stage:
+                field_path = stage["$unwind"].lstrip("$")
+                unwound_docs: List[Dict[str, Any]] = []
+                for doc in docs:
+                    values = self._get_value(doc, field_path)
+                    if isinstance(values, list):
+                        for value in values:
+                            new_doc = copy.deepcopy(doc)
+                            parent = new_doc
+                            parts = field_path.split(".")
+                            for part in parts[:-1]:
+                                parent = parent[part]
+                            parent[parts[-1]] = value
+                            unwound_docs.append(new_doc)
+                docs = unwound_docs
+
+            elif "$group" in stage:
+                group_id = stage["$group"].get("_id")
+                # If _id is a string, treat it as a field path and group by that field.
+                if isinstance(group_id, str):
+                    group_field = group_id.lstrip("$")
+                    seen = set()
+                    grouped_docs = []
+                    for doc in docs:
+                        value = self._get_value(doc, group_field)
+                        if value not in seen:
+                            seen.add(value)
+                            grouped_docs.append({"_id": value})
+                    docs = grouped_docs
+                else:
+                    # For non-string _id (e.g. constants or complex expressions),
+                    # fall back to grouping all documents into a single bucket
+                    # with that _id value. This avoids AttributeError from calling
+                    # string methods on non-string values.
+                    if docs:
+                        docs = [{"_id": group_id}]
+                    else:
+                        docs = []
+
+            elif "$sort" in stage:
+                sort_field, direction = next(iter(stage["$sort"].items()))
+                reverse = direction == -1
+                docs = sorted(
+                    docs,
+                    key=lambda d: (d.get(sort_field) is None, d.get(sort_field)),
+                    reverse=reverse,
+                )
+
+        for doc in docs:
+            yield doc
+
+
+def _create_collections():
+    mongodb_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
+    timeout_ms = int(os.getenv("MONGODB_SERVER_SELECTION_TIMEOUT_MS", "2000"))
+
+    try:
+        mongo_client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=timeout_ms)
+        mongo_client.admin.command("ping")
+        database = mongo_client["mergington_high"]
+        return mongo_client, database["activities"], database["teachers"], "mongodb"
+    except Exception:
+        return None, InMemoryCollection(), InMemoryCollection(), "in-memory"
+
+
+client, activities_collection, teachers_collection, DATABASE_BACKEND = _create_collections()
 
 # Methods
 
